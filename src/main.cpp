@@ -19,9 +19,9 @@
 #include "TimerInterrupt.h"
 
 #include <Arduino.h>
-#include<Wire.h>
-#include<Adafruit_GFX.h>
-#include<Adafruit_SSD1306.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 #define OLED_ADDRESS 0x3C
 #define SCREEN_WIDTH 128
@@ -44,7 +44,7 @@ const uint8_t ENC_SENSITIVITY       (1);
 const bool    ENC_ACTIVE_LOW        (1);
 const uint8_t ENC_STEPS_PER_NOTCH   (4);
 
-constexpr uint8_t TIMER_INTERVAL_MS(1);
+constexpr uint8_t TIMER_INTERVAL_MS (1);
 
 enum modeType
 {
@@ -114,6 +114,14 @@ ClickEncoderInterface encoderInterface(encoder, ENC_SENSITIVITY);
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
+bool OLED_FLAG();
+bool CLOCK_FLAG();
+
+void updateOutputs();
+void writeOutputVals(uint8_t outval = 0);
+
+void doNav();
+void seqStep();
 void updateOled();
 
 void savePatternToEeprom();
@@ -128,8 +136,8 @@ void encoderClick();
 void encoderMove(bool up);
 void encoderDoubleClick();
 
-void reset();
 void calcPattern();
+void resetPattern();
 
 void drawTrackLabels();
 void drawTrackPatterns();
@@ -137,6 +145,7 @@ void drawModeOptions();
 void drawStepIndicator();
 
 void setHighlighted(bool inverted);
+char getStepChar(uint8_t track, uint8_t step, bool mute);
 
 constexpr uint8_t OLED_INTERVAL_MS(100);
 uint8_t oledTimer(0);
@@ -204,16 +213,10 @@ uint8_t barCounter(0);
 uint8_t loopCounter(0);
 uint8_t setCounter(0);
 
-
-void reset()
-{
-  stepCounter = 0;
-  barCounter = 0;
-  loopCounter = 0;
-  setCounter = 0;
-
-  calcPattern();
-}
+bool NEW_BAR(0);
+bool NEW_LOOP(0);
+bool NEW_SET(0);
+bool FILL_STEP(0);
 
 
 void timer1_ISR()
@@ -227,6 +230,60 @@ void timer1_ISR()
     oledTimerExpired = true;
     oledTimer = 0;
   }
+}
+
+
+void setup()
+{
+  Serial.begin(9600);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+
+  updateOled();
+
+  for (uint8_t row(0); row < NUM_OLED_ROWS; ++row)
+  {
+    ROW_Y_VALS[row] = row * OLED_ROW_HEIGHT;
+  }
+
+  for (uint8_t col(0); col < NUM_OLED_COLS; ++col)
+  {
+    COL_X_VALS[col] = col * OLED_COL_WIDTH;
+  }
+
+  // Using ATmega328 used in UNO => 16MHz CPU clock ,
+  ITimer1.init();
+  ITimer1.attachInterruptInterval(TIMER_INTERVAL_MS, timer1_ISR);
+  resetPattern();
+}
+
+
+void loop()
+{
+  if (CLOCK_FLAG())
+  {
+    seqStep();
+    updateOutputs();
+  }
+
+  doNav();
+
+  if (OLED_FLAG())
+  {
+    updateOled();
+  }
+}
+
+
+void resetPattern()
+{
+  stepCounter = 0;
+  barCounter = 0;
+  loopCounter = 0;
+  setCounter = 0;
+
+  calcPattern();
 }
 
 
@@ -268,31 +325,18 @@ void testOLED()
 }
 
 
-void setup()
+void setHighlighted(bool inverted)
 {
-  Serial.begin(9600);
-  // OLED setting
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  display.setTextSize(1);
-  display.setTextColor(WHITE);
-
-  updateOled();
-  for (uint8_t row(0); row < NUM_OLED_ROWS; ++row)
+  if (inverted)
   {
-    ROW_Y_VALS[row] = row * OLED_ROW_HEIGHT;
+    display.setTextColor(BLACK, WHITE);
   }
-
-  for (uint8_t col(0); col < NUM_OLED_COLS; ++col)
+  else
   {
-    COL_X_VALS[col] = col * OLED_COL_WIDTH;
+    display.setTextColor(WHITE);
   }
-  // testOLED();
-  ITimer1.init();
-
-  // Using ATmega328 used in UNO => 16MHz CPU clock ,
-  ITimer1.attachInterruptInterval(TIMER_INTERVAL_MS, timer1_ISR);
-  reset();
 }
+
 
 
 void drawTrackLabels()
@@ -409,6 +453,7 @@ void drawStepIndicator()
   display.drawRect(xVal, yVal, width, height, WHITE);
 }
 
+
 char getStepChar(uint8_t track, uint8_t step, bool mute)
 {
   if (mute)
@@ -446,6 +491,7 @@ void getPattern()
   }
 }
 
+
 void newPattern()
 {
   switch (genreIdx)
@@ -463,6 +509,7 @@ void newPattern()
 
   getPattern();
 }
+
 
 void getFill()
 {
@@ -485,11 +532,6 @@ void getFill()
   }
 }
 
-
-bool NEW_BAR(0);
-bool NEW_LOOP(0);
-bool NEW_SET(0);
-bool FILL_STEP(0);
 
 void calcPattern()
 {
@@ -554,7 +596,7 @@ void seqStep()
 }
 
 
-void writeOutputVals(uint8_t outVal = 0)
+void writeOutputVals(uint8_t outVal /*= 0*/)
 {
   for (uint8_t ch(0); ch < NUM_CHANNELS; ++ch)
   {
@@ -615,36 +657,6 @@ void doNav()
     case encEvnts::NUM_ENC_EVNTS:
     default:
       break;
-  }
-}
-
-
-void loop()
-{
-  if (CLOCK_FLAG())
-  {
-    seqStep();
-    updateOutputs();
-  }
-
-  doNav();
-
-  if (OLED_FLAG())
-  {
-    updateOled();
-  }
-}
-
-
-void setHighlighted(bool inverted)
-{
-  if (inverted)
-  {
-    display.setTextColor(BLACK, WHITE);
-  }
-  else
-  {
-    display.setTextColor(WHITE);
   }
 }
 

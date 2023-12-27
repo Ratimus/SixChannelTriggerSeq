@@ -3,19 +3,20 @@
 // Don't define _TIMERINTERRUPT_LOGLEVEL_ > 0. Only for special ISR debugging only. Can hang the system.
 #define TIMER_INTERRUPT_DEBUG         0
 #define _TIMERINTERRUPT_LOGLEVEL_     0
+#define USE_TIMER_1     true
 
-#if ( defined(__AVR_ATmega644__) || defined(__AVR_ATmega644A__) || defined(__AVR_ATmega644P__) || defined(__AVR_ATmega644PA__)  || \
-        defined(ARDUINO_AVR_UNO) || defined(ARDUINO_AVR_NANO) || defined(ARDUINO_AVR_MINI) ||    defined(ARDUINO_AVR_ETHERNET) || \
-        defined(ARDUINO_AVR_FIO) || defined(ARDUINO_AVR_BT)   || defined(ARDUINO_AVR_LILYPAD) || defined(ARDUINO_AVR_PRO)      || \
-        defined(ARDUINO_AVR_NG) || defined(ARDUINO_AVR_UNO_WIFI_DEV_ED) || defined(ARDUINO_AVR_DUEMILANOVE) || defined(ARDUINO_AVR_FEATHER328P) || \
-        defined(ARDUINO_AVR_METRO) || defined(ARDUINO_AVR_PROTRINKET5) || defined(ARDUINO_AVR_PROTRINKET3) || defined(ARDUINO_AVR_PROTRINKET5FTDI) || \
-        defined(ARDUINO_AVR_PROTRINKET3FTDI) )
-  #define USE_TIMER_1     true
-  #warning Using Timer1
-#else
-  #define USE_TIMER_3     true
-  #warning Using Timer3
-#endif
+// #if ( defined(__AVR_ATmega644__)   || defined(__AVR_ATmega644A__)          || defined(__AVR_ATmega644P__)      || defined(__AVR_ATmega644PA__)         || \
+//         defined(ARDUINO_AVR_UNO)   || defined(ARDUINO_AVR_NANO)            || defined(ARDUINO_AVR_MINI)        || defined(ARDUINO_AVR_ETHERNET)        || \
+//         defined(ARDUINO_AVR_FIO)   || defined(ARDUINO_AVR_BT)              || defined(ARDUINO_AVR_LILYPAD)     || defined(ARDUINO_AVR_PRO)             || \
+//         defined(ARDUINO_AVR_NG)    || defined(ARDUINO_AVR_UNO_WIFI_DEV_ED) || defined(ARDUINO_AVR_DUEMILANOVE) || defined(ARDUINO_AVR_FEATHER328P)     || \
+//         defined(ARDUINO_AVR_METRO) || defined(ARDUINO_AVR_PROTRINKET5)     || defined(ARDUINO_AVR_PROTRINKET3) || defined(ARDUINO_AVR_PROTRINKET5FTDI) || \
+//         defined(ARDUINO_AVR_PROTRINKET3FTDI) )
+//   #define USE_TIMER_1     true
+//   #warning Using Timer1
+// #else
+//   #define USE_TIMER_3     true
+//   #warning Using Timer3
+// #endif
 #include "TimerInterrupt.h"
 
 #include <Arduino.h>
@@ -30,21 +31,31 @@
 #include <EEPROM.h>
 
 #include "riddims.h"
+#include "FastShiftOut.h"
 
 #include "MagicButton.h"
 #include "ClickEncoder.h"
 #include "ClickEncoderInterface.h"
 
-constexpr uint8_t ENC_A(3);
-constexpr uint8_t ENC_B(2);
-constexpr uint8_t CLOCK_PIN(6);
-constexpr uint8_t ENC_SW(12);
+constexpr uint8_t ENC_A             (2);
+constexpr uint8_t ENC_B             (3);
+constexpr uint8_t ENC_SW            (4);
+constexpr uint8_t CLOCK_PIN         (11);
+constexpr uint8_t RESET_PIN         (12);
 
+constexpr uint8_t SR_CLK            (5);
+constexpr uint8_t SR_LCH            (6);
+constexpr uint8_t SR_DAT            (8);
+
+constexpr uint8_t CTRL              (A7);
 const uint8_t ENC_SENSITIVITY       (1);
 const bool    ENC_ACTIVE_LOW        (1);
 const uint8_t ENC_STEPS_PER_NOTCH   (4);
 
+constexpr uint8_t TRIGGER_LENGTH(10);
 constexpr uint8_t TIMER_INTERVAL_MS (1);
+constexpr uint8_t OUTPUT_MAP[]{5, 0, 4, 7, 3, 6, 1, 2};
+uint8_t           outputRegister(0);
 
 enum modeType
 {
@@ -105,24 +116,31 @@ modeType MANUAL_MODES[NUM_MANUAL_MODES]{
 
 const uint8_t MODE_SELECT_LOCATION[2]{6, 12};
 
-// uint8_t OUTPUT_PIN[]{5, 6, 7, 8, 9, 10};
+FastShiftOut outputs(SR_DAT, SR_CLK, MSBFIRST);
 
-MagicButton manualClock(CLOCK_PIN, 1, 0);
+// #define CASSIDEBUG
+
+bool newPatternFlag(0);
+
+volatile bool _clockFlag(0);
+volatile bool _resetFlag(0);
+volatile bool clockPulse[]{0, 0};
+volatile bool resetPulse[]{0, 0};
 
 ClickEncoder encoder(ENC_A, ENC_B, ENC_SW, ENC_STEPS_PER_NOTCH, ENC_ACTIVE_LOW);
 ClickEncoderInterface encoderInterface(encoder, ENC_SENSITIVITY);
-
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-bool OLED_FLAG();
 bool CLOCK_FLAG();
+bool RESET_FLAG();
+bool OUTPUTS_EXPIRED();
 
-void updateOutputs();
-void writeOutputVals(uint8_t outval = 0);
+uint8_t getOutputVal();
+void writeOutputRegister(uint8_t outval = 0);
 
 void doNav();
 void seqStep();
-void updateOled();
+void oled_redraw();
 
 void savePatternToEeprom();
 void loadPatternFromEeprom();
@@ -131,29 +149,27 @@ void changeModes();
 void changeGenres();
 void changeSetLength();
 void changeLoopLength();
+void loadNextPattern();
 
 void encoderClick();
 void encoderMove(bool up);
 void encoderDoubleClick();
 
-void calcPattern();
-void resetPattern();
+void decideNextPattern();
+void calculateNextStep();
+void resetSeqPattern();
 
 void drawTrackLabels();
 void drawTrackPatterns();
 void drawModeOptions();
 void drawStepIndicator();
 
-void setHighlighted(bool inverted);
-char getStepChar(uint8_t track, uint8_t step, bool mute);
+void highlightTextIf(bool inverted);
+void getStepChar(uint8_t track, uint8_t step, bool mute, char * buf);
 
-constexpr uint8_t OLED_INTERVAL_MS(100);
-uint8_t oledTimer(0);
-volatile bool oledTimerExpired(0);
+constexpr uint8_t OLED_INTERVAL_MS(200);
 
 constexpr uint8_t NUM_CHANNELS(6);
-constexpr uint8_t CHANNEL_LABEL_NUM_CHARS(4);
-constexpr char CHANNEL_LABELS[NUM_CHANNELS][CHANNEL_LABEL_NUM_CHARS]{"CH1", "CH2", "CH3", "CH4", "CH5", "CH6"};
 
 constexpr uint8_t ROW_HEIGHT_NO_MARGIN(8);
 constexpr uint8_t OLED_ROW_HEIGHT(ROW_HEIGHT_NO_MARGIN + 1);
@@ -162,85 +178,134 @@ constexpr uint8_t NUM_OLED_ROWS(SCREEN_HEIGHT / OLED_ROW_HEIGHT);
 constexpr uint8_t COL_WIDTH_NO_MARGIN(6);
 constexpr uint8_t OLED_COL_WIDTH(COL_WIDTH_NO_MARGIN + 1);
 constexpr uint8_t NUM_OLED_COLS(SCREEN_WIDTH / OLED_COL_WIDTH);
-
+constexpr uint8_t CHANNEL_LABEL_NUM_CHARS(4);
 constexpr uint8_t TRACK_STEP_X_VAL(CHANNEL_LABEL_NUM_CHARS * OLED_COL_WIDTH + 2);
-constexpr uint8_t BOTTOM_ROW_Y_VAL(OLED_ROW_HEIGHT * NUM_OLED_ROWS);
+constexpr uint8_t BOTTOM_ROW_Y_VAL(OLED_ROW_HEIGHT * (NUM_OLED_ROWS - 1));
 
 constexpr uint8_t REP_COUNT_X_VAL(0);
-constexpr uint8_t SWITCH_COUNT_X_VAL(70);
-constexpr uint8_t GENRE_LABEL_X_VAL(36);
-constexpr uint8_t FILL_LABEL_X_VAL(84);
+constexpr uint8_t SWITCH_COUNT_X_VAL(82);
+constexpr uint8_t GENRE_LABEL_X_VAL(30);
+constexpr uint8_t FILL_LABEL_X_VAL(90);
 constexpr uint8_t MODE_LABEL_X_VAL(0);
-constexpr uint8_t RESET_LABEL_X_VAL(48);
-constexpr uint8_t SAVE_LABEL_X_VAL(102);
+constexpr uint8_t RESET_LABEL_X_VAL(96);
+constexpr uint8_t SAVE_LABEL_X_VAL(48);
 
 uint8_t ROW_Y_VALS[NUM_OLED_ROWS];
 uint8_t COL_X_VALS[NUM_OLED_COLS];
 
+int8_t            outputOnTime(-1);
+bool              outputsExpired(0);
+
+uint8_t           genreIdx(0);
 constexpr uint8_t NUM_GENRES(4);
-constexpr char genreNames[NUM_GENRES][7]{"TECHNO", "DUBTCH", "HOUSE ", "SHIT  "};
-uint8_t genreIdx(0);
+bool              newGenreFlag(0);
+constexpr char    genreNames[NUM_GENRES][7]{"TECHNO", "DUBTEK", "HOUSE ", "SHIT  "};
 
-uint8_t muteRegister(0);
-uint16_t patternRegister[NUM_CHANNELS]{0x8888, 0x0808, 0xCCCC, 0x2222, 0xFFFF, 0x0000};
+uint8_t  muteRegister(0);
+uint16_t patternRegister[NUM_CHANNELS]{0, 0, 0, 0, 0, 0};
+uint16_t variationRegister[NUM_CHANNELS]{0, 0, 0, 0, 0, 0};
+uint16_t oledTrackRegister[NUM_CHANNELS]{0, 0, 0, 0, 0, 0};
+uint16_t *pCurrentPattern(patternRegister);
 
-int8_t modeIdx(0);
+int8_t  modeIdx(0);
 uint8_t modePage(0);
 
-bool AUTO_MODE(1);
-bool STEP_EDIT_SUBMODE(0);
+bool autoMode(1);
+bool stepEditSubmode(0);
 
-int8_t selStep(0);
-int8_t selTrack(0);
+int8_t  selStep(0);
+int8_t  selTrack(0);
 uint8_t patternLength(16);
 
-bool FILLS_ON(1);
+bool fillsEnabled(1);
+bool playFillThisBar(0);
 
-uint8_t pattern_idx(0);
-typedef word pPattern[8][12];
-pPattern * usePattern;
+int8_t patternSelectIdx(-1);
+int8_t nextPattern(0);
 
-int8_t loopLenIdx(0);
+int8_t           loopLenIdx(0);
 constexpr int8_t NUM_LOOP_LENGTHS(4);
 constexpr int8_t LOOP_LENGTHS[NUM_LOOP_LENGTHS]{4, 8, 16, 32};
 
-int8_t setLenIdx(0);
+int8_t           setLenIdx(0);
 constexpr int8_t NUM_SET_LENGTHS(4);
 constexpr int8_t SET_LENGTHS[NUM_SET_LENGTHS]{2, 4, 8, 16};
 
-int8_t stepCounter(0);
+int8_t  currentStep(-1);
+int8_t  nextStep(0);
+
 uint8_t barCounter(0);
 uint8_t loopCounter(0);
 uint8_t setCounter(0);
 
-bool NEW_BAR(0);
-bool NEW_LOOP(0);
-bool NEW_SET(0);
-bool FILL_STEP(0);
+bool resetBar(0);
+bool resetLoop(0);
+bool newSetStarted(0);
+bool lastBarOfLoop(0);
+
+/*
+Weird stuff:
+
+Fills are NOT calculated correctly
+Pattern changes on Cycle Reset are NOT calculated correctly
+Genre changes on Cycle Reset are NOT calculated correctly
+Pattern Select CTRL CV has no effect
+*/
+void loadPattern(uint8_t patternIdx);
 
 
 void timer1_ISR()
 {
-  encoder.service();
-  manualClock.service();
-
-  ++oledTimer;
-  if (oledTimer >= OLED_INTERVAL_MS)
+  clockPulse[1] = clockPulse[0];
+  clockPulse[0] = !digitalRead(CLOCK_PIN);
+  if (clockPulse[0] && !clockPulse[1])
   {
-    oledTimerExpired = true;
-    oledTimer = 0;
+    writeOutputRegister(0);
+    currentStep = nextStep;
+    writeOutputRegister(getOutputVal());
+    outputOnTime = TRIGGER_LENGTH;
+    _clockFlag = 1;
   }
+
+  resetPulse[1] = resetPulse[0];
+  resetPulse[0] = !digitalRead(RESET_PIN);
+  if (resetPulse[0] && !resetPulse[1])
+  {
+    _resetFlag = 1;
+  }
+
+  if (outputOnTime >= 0)
+  {
+    --outputOnTime;
+  }
+
+  if (outputOnTime < 0)
+  {
+    outputsExpired = 1;
+  }
+
+  encoder.service();
 }
 
 
 void setup()
 {
-  Serial.begin(9600);
+#ifdef CASSIDEBUG
+  Serial.begin(115200);
+  delay(100);
+#endif
+
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.setTextSize(1);
   display.setTextColor(WHITE);
 
-  updateOled();
+  delay(100);
+  pinMode(SR_LCH, OUTPUT);
+  writeOutputRegister(0x00);
+  pinMode(CTRL, INPUT);
+
+  pinMode(RESET_PIN, INPUT_PULLUP);
+  pinMode(CLOCK_PIN, INPUT_PULLUP);
 
   for (uint8_t row(0); row < NUM_OLED_ROWS; ++row)
   {
@@ -252,71 +317,98 @@ void setup()
     COL_X_VALS[col] = col * OLED_COL_WIDTH;
   }
 
-  // Using ATmega328 used in UNO => 16MHz CPU clock ,
+  resetSeqPattern();
+
   ITimer1.init();
   ITimer1.attachInterruptInterval(TIMER_INTERVAL_MS, timer1_ISR);
-  resetPattern();
 }
 
 
 void loop()
 {
+  if (OUTPUTS_EXPIRED())
+  {
+    writeOutputRegister(0);
+  }
+
+  if (RESET_FLAG())
+  {
+    resetSeqPattern();
+  }
+
   if (CLOCK_FLAG())
   {
     seqStep();
-    updateOutputs();
   }
 
   doNav();
-
-  if (OLED_FLAG())
+  decideNextPattern();
+  if ((nextStep == -1) && (newGenreFlag || newPatternFlag))
   {
-    updateOled();
+    calculateNextStep();
   }
 }
 
 
-void resetPattern()
+void resetSeqPattern()
 {
-  stepCounter = 0;
+  patternSelectIdx = -1;
+  currentStep = -1;
+  nextPattern = 0;
+  nextStep = 0;
   barCounter = 0;
   loopCounter = 0;
   setCounter = 0;
-
-  calcPattern();
+  newPatternFlag = true;
 }
 
 
-bool OLED_FLAG()
+bool OUTPUTS_EXPIRED()
 {
   bool ret(0);
-  cli();
-  if (oledTimerExpired)
+  if (outputsExpired)
   {
-    oledTimerExpired = 0;
+    outputsExpired = 0;
     ret = 1;
   }
-  sei();
   return ret;
 }
 
 
 bool CLOCK_FLAG()
 {
-  return (manualClock.readAndFree() == ButtonState :: Clicked);
+  bool ret(0);
+  if (_clockFlag)
+  {
+    ret = 1;
+    _clockFlag = 0;
+  }
+  return ret;
+}
+
+
+bool RESET_FLAG()
+{
+  bool ret(0);
+  if (_resetFlag)
+  {
+    ret = 1;
+    _resetFlag = 0;
+  }
+  return ret;
 }
 
 
 void testOLED()
 {
-  uint8_t val(0);
+  uint8_t printChar(0);
   display.clearDisplay();
   for (uint8_t row(0); row < NUM_OLED_ROWS; ++row)
   {
     for (uint8_t col(0); col < NUM_OLED_COLS; ++col)
     {
       display.setCursor(COL_X_VALS[col], ROW_Y_VALS[row]);
-      display.print(char(val++));
+      display.print(char(printChar++));
       display.display();
       delay(66);
     }
@@ -325,7 +417,15 @@ void testOLED()
 }
 
 
-void setHighlighted(bool inverted)
+void writeOutputRegister(uint8_t regval)
+{
+  digitalWrite(SR_LCH, LOW);
+  outputs.write(regval);
+  digitalWrite(SR_LCH, HIGH);
+}
+
+
+void highlightTextIf(bool inverted)
 {
   if (inverted)
   {
@@ -338,16 +438,16 @@ void setHighlighted(bool inverted)
 }
 
 
-
 void drawTrackLabels()
 {
   for (uint8_t track(0); track < NUM_CHANNELS; ++track)
   {
     display.setCursor(0, ROW_Y_VALS[track]);
-    setHighlighted((encMode >= mute0_MODE && encMode <= mute5_MODE) && (selTrack == track));
-    display.print(CHANNEL_LABELS[track]);
+    highlightTextIf((encMode >= mute0_MODE && encMode <= mute5_MODE) && (selTrack == track));
+    display.print("CH");
+    display.print(track + 1);
   }
-  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
 }
 
 
@@ -357,16 +457,18 @@ void drawTrackPatterns()
   uint8_t yVal(0);
   for (uint8_t track(0); track < NUM_CHANNELS; ++track)
   {
-    bool editTrack(STEP_EDIT_SUBMODE && track == selTrack);
+    bool editTrack(stepEditSubmode && track == selTrack);
     bool mute(bitRead(muteRegister, track) && !editTrack);
 
     yVal = ROW_Y_VALS[track];
-    for (uint8_t step(0); step < 16; ++step)
+    for (uint8_t step(0); step < patternLength; ++step)
     {
       xVal = TRACK_STEP_X_VAL + step * COL_WIDTH_NO_MARGIN;
       display.setCursor(xVal, yVal);
-      setHighlighted(editTrack && step == selStep);
-      display.print(getStepChar(track, step, mute));
+      highlightTextIf(editTrack && step == selStep);
+      char val[2];
+      getStepChar(track, step, mute, val);
+      display.print(val);
     }
 
     if (encMode != edit0_MODE &&
@@ -395,15 +497,12 @@ void drawModeOptions()
 {
   if (modePage)
   {
-    display.setTextColor(WHITE);
     display.setCursor(REP_COUNT_X_VAL, BOTTOM_ROW_Y_VAL);
-
-    display.print(" ");
-
+    display.setTextColor(WHITE);
     display.print("BAR:");
     display.print(barCounter + 1);
     display.print("/");
-    setHighlighted(encMode == loopLength_MODE);
+    highlightTextIf(encMode == loopLength_MODE);
     display.print(LOOP_LENGTHS[loopLenIdx]);
 
     display.setTextColor(WHITE);
@@ -411,42 +510,71 @@ void drawModeOptions()
     display.print("LP:");
     display.print(loopCounter + 1);
     display.print("/");
-    setHighlighted(encMode == setLength_MODE);
-    display.print(SET_LENGTHS[setLenIdx]);
+    highlightTextIf(encMode == setLength_MODE);
+    uint8_t len(SET_LENGTHS[setLenIdx]);
+    display.print(len);
+    display.setTextColor(BLACK);
     return;
   }
 
   display.setCursor(MODE_LABEL_X_VAL, BOTTOM_ROW_Y_VAL);
-  setHighlighted(encMode == selectMode_MODE);
-  display.print(AUTO_MODE ? "AUTO" : "MNAL");
+  highlightTextIf(encMode == selectMode_MODE);
+  display.print(autoMode ? "AUTO" : "MNAL");
 
-  if (AUTO_MODE)
+  if (autoMode)
   {
     display.setCursor(GENRE_LABEL_X_VAL, BOTTOM_ROW_Y_VAL);
-    setHighlighted(encMode == selectGenre_MODE);
-    display.print(genreNames[genreIdx]);
+    highlightTextIf(encMode == selectGenre_MODE);
+    if (newGenreFlag)
+    {
+      display.print(char(26));
+      display.print(genreNames[genreIdx]);
+      display.print(":");
+      display.print(nextPattern + 1);
+    }
+    else
+    {
+      display.print(genreNames[genreIdx]);
+      if (nextPattern != patternSelectIdx)
+      {
+        display.print(char(26));
+        display.print(nextPattern + 1);
+      }
+      else
+      {
+        display.print(":");
+        display.print(patternSelectIdx + 1);
+      }
+    }
 
     display.setTextColor(WHITE);
     display.setCursor(FILL_LABEL_X_VAL, BOTTOM_ROW_Y_VAL);
-    display.print("FilIN:");
-    setHighlighted(encMode == toggleFills_MODE);
-    display.print(FILLS_ON ? "Y" : "N");
+    highlightTextIf(playFillThisBar);
+    display.print("Fill:");
+    highlightTextIf(encMode == toggleFills_MODE);
+    display.print(fillsEnabled ? "Y" : "N");
+    display.setTextColor(BLACK);
+
     return;
   }
 
   display.setCursor(RESET_LABEL_X_VAL, BOTTOM_ROW_Y_VAL);
-  setHighlighted(encMode == resetPattern_MODE);
+  highlightTextIf(encMode == resetPattern_MODE);
   display.print("RESET");
 
   display.setCursor(SAVE_LABEL_X_VAL, BOTTOM_ROW_Y_VAL);
-  setHighlighted(encMode == saveData_MODE);
+  highlightTextIf(encMode == saveData_MODE);
   display.print("SAVE");
 }
 
 
 void drawStepIndicator()
 {
-  uint8_t xVal(TRACK_STEP_X_VAL + stepCounter * COL_WIDTH_NO_MARGIN);
+  if (currentStep == -1)
+  {
+    return;
+  }
+  uint8_t xVal(TRACK_STEP_X_VAL + currentStep * COL_WIDTH_NO_MARGIN);
   uint8_t yVal(0);
   uint8_t width(COL_WIDTH_NO_MARGIN);
   uint8_t height(NUM_CHANNELS * OLED_ROW_HEIGHT - 1);
@@ -454,174 +582,192 @@ void drawStepIndicator()
 }
 
 
-char getStepChar(uint8_t track, uint8_t step, bool mute)
+const char space[2] = " ";
+const char splat[2] = "*";
+const char under[2] = "_";
+void getStepChar(uint8_t track, uint8_t step, bool mute, char * buf)
 {
   if (mute)
   {
-    return ' ';
+    memcpy(buf, &space, 2);
+    return;
   }
 
-  if (bitRead(patternRegister[track], 15 - step))
+  if (bitRead(oledTrackRegister[track], 15 - step))
   {
-    return '*';
+    memcpy(buf, &splat, 2);
+    return;
   }
 
-  return '_';
-}
-
-
-void getPattern()
-{
-  switch (genreIdx)
-  {
-    case 0:
-      usePattern = (pPattern*)(&bnk1_ptn);
-      break;
-    case 1:
-      usePattern = (pPattern*)(&bnk2_ptn);
-      break;
-    case 2:
-      usePattern = (pPattern*)(&bnk3_ptn);
-      break;
-  }
-
-  for (uint8_t ch(0); ch < 6; ++ch)
-  {
-    patternRegister[ch] = pgm_read_word((*usePattern)[pattern_idx][ch + 6]);
-  }
-}
-
-
-void newPattern()
-{
-  switch (genreIdx)
-  {
-    case 0:
-      pattern_idx = random(0, 7);
-      break;
-    case 1:
-      pattern_idx = random(0, 4);
-      break;
-    case 2:
-      pattern_idx = random(0, 4);
-      break;
-  }
-
-  getPattern();
-}
-
-
-void getFill()
-{
-  switch (genreIdx)
-  {
-    case 0:
-      usePattern = (pPattern*)(&bnk1_ptn);
-      break;
-    case 1:
-      usePattern = (pPattern*)(&bnk2_ptn);
-      break;
-    case 2:
-      usePattern = (pPattern*)(&bnk3_ptn);
-      break;
-  }
-
-  for (uint8_t ch(0); ch < 6; ++ch)
-  {
-    patternRegister[ch] = pgm_read_word((*usePattern)[pattern_idx][ch]);
-  }
-}
-
-
-void calcPattern()
-{
-  FILL_STEP = 0;
-  NEW_BAR = (stepCounter == 0);
-  if (NEW_BAR)
-  {
-    Serial.println("New bar");
-    if (barCounter >= LOOP_LENGTHS[loopLenIdx])
-    {
-      ++loopCounter;
-      barCounter = 0;
-    }
-    else if (barCounter == LOOP_LENGTHS[loopLenIdx] - 1)
-    {
-      FILL_STEP = 1;
-    }
-  }
-
-  NEW_LOOP = NEW_BAR && (barCounter == 0);
-  if (NEW_LOOP)
-  {
-    Serial.println("New loop");
-    if (loopCounter >= SET_LENGTHS[setLenIdx])
-    {
-      loopCounter = 0;
-    }
-  }
-
-  NEW_SET = NEW_LOOP && (loopCounter == 0);
-
-  if (NEW_SET)
-  {
-    // Serial.println("New set");
-    newPattern();
-  }
-  else if (FILL_STEP)
-  {
-    // Serial.println("Last bar - play fill");
-    getFill();
-  }
-  else if (NEW_BAR)
-  {
-    // Serial.println("Same ol' pattern");
-    getPattern();
-  }
+  memcpy(buf, &under, 2);
 }
 
 
 void seqStep()
 {
-  Serial.println(stepCounter);
-
-  ++stepCounter;
-  if (stepCounter >= 16)
-  {
-    stepCounter = 0;
-    ++barCounter;
-  }
-
-  calcPattern();
+  oled_redraw();
+  ++nextStep;
+  calculateNextStep();
 }
 
 
-void writeOutputVals(uint8_t outVal /*= 0*/)
-{
-  for (uint8_t ch(0); ch < NUM_CHANNELS; ++ch)
-  {
-    bitRead(outVal, ch);
-  }
-}
-
-
-void updateOutputs()
+uint8_t getOutputVal()
 {
   uint8_t outVal(0);
   for (uint8_t ch(0); ch < NUM_CHANNELS; ++ch)
   {
-    if bitRead(muteRegister, stepCounter)
+    if bitRead(muteRegister, currentStep)
     {
       continue;
     }
 
-    if (!bitRead(patternRegister[ch], stepCounter))
+    if (!bitRead(*(pCurrentPattern + ch), currentStep))
     {
       continue;
     }
 
-    bitWrite(outVal, ch, 1);
+    bitWrite(outVal, OUTPUT_MAP[ch], 1);
   }
+  return outVal;
+}
+
+
+void loadPattern(uint8_t patternIdx)
+{
+  for (uint8_t ch(0); ch < 6; ++ch)
+  {
+    switch (genreIdx)
+    {
+      case 0:
+        patternRegister[ch] = pgm_read_word(bnk1_ptn[patternIdx] + ch);
+        variationRegister[ch] = pgm_read_word(bnk1_ptn[patternIdx] + ch + 6);
+        break;
+
+      case 1:
+        patternRegister[ch] = pgm_read_word(bnk2_ptn[patternIdx] + ch);
+        variationRegister[ch] = pgm_read_word(bnk2_ptn[patternIdx] + ch + 6);
+        break;
+
+      case 2:
+        patternRegister[ch] = pgm_read_word(bnk3_ptn[patternIdx] + ch);
+        variationRegister[ch] = pgm_read_word(bnk2_ptn[patternIdx] + ch + 6);
+        break;
+
+      case 3:
+        patternRegister[ch] = pgm_read_word(bnk4_ptn[patternIdx] + ch);
+        variationRegister[ch] = pgm_read_word(bnk2_ptn[patternIdx] + ch + 6);
+        break;
+
+      default:
+        break;
+    }
+  }
+}
+
+
+void decideNextPattern()
+{
+  int16_t cv(analogRead(CTRL));
+  uint8_t maxIdx(4);
+  if (genreIdx == 0 || genreIdx == 3)
+  {
+    maxIdx += 3;
+  }
+
+  uint8_t cvPattern(map(cv, 0, 704, 0, maxIdx + 1));
+  if (cvPattern > maxIdx)
+  {
+    cvPattern = maxIdx;
+  }
+
+  if (cvPattern != nextPattern)
+  {
+    nextPattern = cvPattern;
+    if (currentStep != -1)
+    {
+      oled_redraw();
+    }
+  }
+
+  if (nextPattern != patternSelectIdx)
+  {
+    newPatternFlag = true;
+  }
+  else if (!newGenreFlag)
+  {
+    return;
+  }
+
+  if (currentStep != -1)
+  {
+    oled_redraw();
+    return;
+  }
+
+  loadNextPattern();
+  calculateNextStep();
+  oled_redraw();
+}
+
+
+void calculateNextStep()
+{
+  if (nextStep >= patternLength)
+  {
+    nextStep = 0;
+    ++barCounter;
+
+    if (barCounter == LOOP_LENGTHS[loopLenIdx] - 1)
+    {
+      if (fillsEnabled)
+      {
+        playFillThisBar = true;
+        pCurrentPattern = variationRegister;
+        for (uint8_t ch(0); ch < NUM_CHANNELS; ++ch)
+        {
+          oledTrackRegister[ch] = *(pCurrentPattern + ch);
+        }
+      }
+      return;
+    }
+
+    if (barCounter == LOOP_LENGTHS[loopLenIdx])
+    {
+      ++loopCounter;
+      barCounter = 0;
+    }
+  }
+
+  if (nextStep != 0)
+  {
+    return;
+  }
+
+  if (loopCounter == SET_LENGTHS[setLenIdx])
+  {
+    loopCounter = 0;
+    loadNextPattern();
+  }
+
+  pCurrentPattern = patternRegister;
+  playFillThisBar = false;
+
+  for (uint8_t ch(0); ch < NUM_CHANNELS; ++ch)
+  {
+    oledTrackRegister[ch] = *(pCurrentPattern + ch);
+  }
+}
+
+
+void loadNextPattern()
+{
+  patternSelectIdx = nextPattern;
+  newPatternFlag = false;
+  newGenreFlag = false;
+  loadPattern(patternSelectIdx);
+#ifdef CASSIDEBUG
+  Serial.print(F("using bank "));Serial.print(patternSelectIdx + 1);Serial.println(F(" of 8"));
+#endif
 }
 
 
@@ -633,14 +779,8 @@ void doNav()
       encoderMove(0);
       break;
 
-    case encEvnts::ShiftLeft:
-      break;
-
     case encEvnts::Right:
       encoderMove(1);
-      break;
-
-    case encEvnts::ShiftRight:
       break;
 
     case encEvnts::Click:
@@ -651,13 +791,16 @@ void doNav()
       encoderDoubleClick();
       break;
 
+    case encEvnts::ShiftRight:
+    case encEvnts::ShiftLeft:
     case encEvnts::Hold:
     case encEvnts::Press:
     case encEvnts::ClickHold:
     case encEvnts::NUM_ENC_EVNTS:
     default:
-      break;
+      return;
   }
+  oled_redraw();
 }
 
 
@@ -728,7 +871,7 @@ void updateSelection()
 
 void encoderMove(bool up)
 {
-  if (AUTO_MODE)
+  if (autoMode)
   {
     modeIdx += up ? 1 : -1;
     if (modeIdx < 0)
@@ -745,7 +888,7 @@ void encoderMove(bool up)
     return;
   }
 
-  if (STEP_EDIT_SUBMODE)
+  if (stepEditSubmode)
   {
     selStep  += up ? 1 : -1;
     if (selStep >= patternLength)
@@ -776,30 +919,33 @@ void encoderMove(bool up)
 
 void savePatternToEeprom()
 {
+  uint8_t writeIdx(0);
   for (uint8_t ch(0); ch < 6; ++ch)
   {
-    EEPROM.update(2 * ch + 1,  highByte(patternRegister[ch]));
-    EEPROM.update(2 * ch + 2,   lowByte(patternRegister[ch]));
+    EEPROM.update(writeIdx++,  highByte(patternRegister[ch]));
+    EEPROM.update(writeIdx++,   lowByte(patternRegister[ch]));
   }
 }
 
 
 void loadPatternFromEeprom()
 {
-  for (uint8_t ch(0); ch < 6; ++ch)
+  uint8_t readIdx(0);
+  for (uint8_t ch(0); ch < NUM_CHANNELS; ++ch)
   {
-    uint8_t idx(2 * ch);
-    patternRegister[ch] = (EEPROM.read(idx + 1) << 8) + EEPROM.read(idx + 2);
+    patternRegister[ch] = EEPROM.read(readIdx++);
+    patternRegister[ch] <<= 8;
+    patternRegister[ch] |= EEPROM.read(readIdx++);
   }
 }
 
 
 void changeModes()
 {
-  if (AUTO_MODE)
+  if (autoMode)
   {
     savePatternToEeprom();
-    newPattern();
+    loadNextPattern();
     modeIdx = MODE_SELECT_LOCATION[0];
   }
   else
@@ -817,6 +963,15 @@ void changeGenres()
   {
     genreIdx = 0;
   }
+  newGenreFlag = 1;
+
+  if (currentStep != -1)
+  {
+    return;
+  }
+
+  calculateNextStep();
+  oled_redraw();
 }
 
 
@@ -842,20 +997,21 @@ void changeLoopLength()
 }
 
 
-void updateOled()
+void oled_redraw()
 {
   display.clearDisplay();
   drawTrackLabels();
   drawTrackPatterns();
-  drawModeOptions();
   drawStepIndicator();
+  drawModeOptions();
+  display.setCursor(0, 0);
   display.display();
 }
 
 
 void encoderClick()
 {
-  if (STEP_EDIT_SUBMODE)
+  if (stepEditSubmode)
   {
     bitToggle(patternRegister[selTrack], 15 - selStep);
     return;
@@ -881,7 +1037,7 @@ void encoderClick()
       break;
 
     case selectMode_MODE:
-      AUTO_MODE = !AUTO_MODE;
+      autoMode = !autoMode;
       changeModes();
       break;
 
@@ -890,7 +1046,7 @@ void encoderClick()
       break;
 
     case toggleFills_MODE:
-      FILLS_ON = !FILLS_ON;
+      fillsEnabled = !fillsEnabled;
       break;
 
     case loopLength_MODE:
@@ -902,7 +1058,13 @@ void encoderClick()
       break;
 
     case saveData_MODE:
+      savePatternToEeprom();
+      break;
+
     case resetPattern_MODE:
+      resetSeqPattern();
+      break;
+
     default:
       break;
   }
@@ -919,7 +1081,7 @@ void encoderDoubleClick()
     case edit3_MODE:
     case edit4_MODE:
     case edit5_MODE:
-      STEP_EDIT_SUBMODE = !STEP_EDIT_SUBMODE;
+      stepEditSubmode = !stepEditSubmode;
       break;
 
     default:

@@ -38,7 +38,7 @@ typedef enum Button_e
 
 
 const uint16_t debounceUP(0b0111111111111111);  // More leading zeros will increase sensitivity
-const int16_t  debounceDN(~debounceUP);
+const uint16_t  debounceDN(~debounceUP);
 
 // Button configuration (values for 1ms timer service calls)
 //
